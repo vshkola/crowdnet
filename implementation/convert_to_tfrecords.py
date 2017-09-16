@@ -6,10 +6,13 @@ from datetime import datetime
 import os
 import random
 import sys
+import csv
 import threading
 
 import numpy as np
 import tensorflow as tf
+
+dict_ds = dict()
 
 def _int64_feature(value):
     """Wrapper for inserting int64 features into Example proto."""
@@ -23,7 +26,7 @@ def _bytes_feature(value):
     return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
 
 
-def _convert_to_example(filename, image_buffer, label, text, height, width):
+def _convert_to_example(filename, image_buffer, agent_id, label, label_complex, text, height, width):
     """Build an Example proto for an example.
 
     Args:
@@ -42,11 +45,13 @@ def _convert_to_example(filename, image_buffer, label, text, height, width):
     image_format = 'JPEG'
 
     example = tf.train.Example(features=tf.train.Features(feature={
+        'agent_id':               _bytes_feature(tf.compat.as_bytes(agent_id)),
         'image/height':           _int64_feature(height),
         'image/width':            _int64_feature(width),
         'image/colorspace':       _bytes_feature(tf.compat.as_bytes(colorspace)),
         'image/channels':         _int64_feature(channels),
         'image/class/label':      _int64_feature(label),
+        'image/class/label_complex': _int64_feature(label_complex),
         'image/class/text':       _bytes_feature(tf.compat.as_bytes(text)),
         'image/format':           _bytes_feature(tf.compat.as_bytes(image_format)),
         'image/filename':         _bytes_feature(tf.compat.as_bytes(os.path.basename(filename))),
@@ -117,6 +122,7 @@ def _process_image_files_batch(coder, thread_index, ranges, name, filenames,
     # Each thread produces N shards where N = int(num_shards / num_threads).
     # For instance, if num_shards = 128, and the num_threads = 2, then the first
     # thread would produce shards [0, 64).
+    global dict_ds
     num_threads = len(ranges)
     assert not num_shards % num_threads
     num_shards_per_batch = int(num_shards / num_threads)
@@ -127,6 +133,7 @@ def _process_image_files_batch(coder, thread_index, ranges, name, filenames,
     num_files_in_thread = ranges[thread_index][1] - ranges[thread_index][0]
 
     counter = 0
+    fail_ctr = 0
     for s in range(num_shards_per_batch):
         # Generate a sharded version of the file name, e.g. 'train-00002-of-00010'
         shard = thread_index * num_shards_per_batch + s
@@ -143,7 +150,6 @@ def _process_image_files_batch(coder, thread_index, ranges, name, filenames,
             filename = filenames[i]
             label = labels[i]
             text = texts[i]
-
             try:
                 image_buffer, height, width = _process_image(filename, coder)
             except Exception as e:
@@ -151,9 +157,19 @@ def _process_image_files_batch(coder, thread_index, ranges, name, filenames,
                 print('SKIPPED: Unexpected eror while decoding %s.' % filename)
                 continue
 
-            example = _convert_to_example(filename, image_buffer, label,
-                                          text, height, width)
-            writer.write(example.SerializeToString())
+            print("Dict size is {}".format(len(dict_ds)))
+            image_id = os.path.splitext(os.path.basename(filename))[0]
+
+            if dict_ds.has_key(image_id):
+                agent_id      = dict_ds.get(image_id)['agent_id']
+                print("Agent Id is {}".format(agent_id))
+                label_complex = int(dict_ds.get(image_id)['label'])
+                example = _convert_to_example(filename, image_buffer, agent_id, label, label_complex, text, height,
+                                              width)
+                writer.write(example.SerializeToString())
+            else:
+                print("image {} wasn't found in a dataset dictionary".format(image_id))
+                fail_ctr += 1
             shard_counter += 1
             counter += 1
 
@@ -161,7 +177,7 @@ def _process_image_files_batch(coder, thread_index, ranges, name, filenames,
                 print('%s [thread %d]: Processed %d of %d images in thread batch.' %
                       (datetime.now(), thread_index, counter, num_files_in_thread))
                 sys.stdout.flush()
-
+        print("Examples loop finished with {} errors".format(fail_ctr))
         writer.close()
         print('%s [thread %d]: Wrote %d images to %s' %
               (datetime.now(), thread_index, shard_counter, output_file))
@@ -233,7 +249,7 @@ def _find_image_files(data_dir, labels_file):
     filenames = []
     texts = []
 
-    # Leave label index 0 empty as a background class. # Not apply, since background is also included into final decision
+    # Leave label index 0 empty as a background class. # Not sapply, since background is also included into final decision
     label_index = 0
 
     # Construct the list of JPEG files and labels.
@@ -264,6 +280,20 @@ def _find_image_files(data_dir, labels_file):
     return filenames, texts, labels
 
 
+def create_dataset_dict(dataset_file):
+    print("read csv from {}".format(dataset_file))
+    reader = csv.DictReader(open(dataset_file))
+    global dict_ds
+
+    result = {}
+    for row in reader:
+        key = row.pop('image_id')
+        if key in result:
+            print("{} key duplicated".format(key))
+        result[key] = row
+    dict_ds = result
+
+
 def _process_dataset(name, directory, num_shards, labels_file):
     """Process a complete data set and save it as a TFRecord.
 
@@ -273,16 +303,24 @@ def _process_dataset(name, directory, num_shards, labels_file):
       num_shards: integer number of shards for this data set.
       labels_file: string, path to the labels file.
     """
+    create_dataset_dict(FLAGS.dataset_file)
+
     filenames, texts, labels = _find_image_files(directory, labels_file)
     _process_image_files(name, filenames, texts, labels, num_shards)
 
-tf.app.flags.DEFINE_string('train_directory', 'dataset/train/',
+tf.app.flags.DEFINE_string('dataset_file', 'dataset_middle.csv',
+                           'Training data csv file')
+
+tf.app.flags.DEFINE_string('train_directory', 'images_big/train',
                            'Training data directory')
 
-tf.app.flags.DEFINE_string('validation_directory', 'dataset/validation/',
+tf.app.flags.DEFINE_string('validation_directory', 'images_big/validation',
                            'Validation data directory')
 
-tf.app.flags.DEFINE_string('output_directory', 'crowdnet',
+tf.app.flags.DEFINE_string('test_directory', 'images/test',
+                           'Test data directory')
+
+tf.app.flags.DEFINE_string('output_directory', 'crowdnet_test',
                            'Output data directory')
 
 tf.app.flags.DEFINE_integer('train_shards', 2,
@@ -290,6 +328,9 @@ tf.app.flags.DEFINE_integer('train_shards', 2,
 
 tf.app.flags.DEFINE_integer('validation_shards', 1,
                             'Number of shards in validation TFRecord files.')
+
+tf.app.flags.DEFINE_integer('test_shards', 1,
+                            'Number of shards in test TFRecord files.')
 
 tf.app.flags.DEFINE_integer('num_threads', 1,
                             'Number of threads to preprocess the images.')
@@ -305,13 +346,18 @@ def main(unused_argv):
     assert not FLAGS.validation_shards % FLAGS.num_threads, (
         'Please make the FLAGS.num_threads commensurate with '
         'FLAGS.validation_shards')
+    assert not FLAGS.test_shards % FLAGS.num_threads, (
+        'Please make the FLAGS.num_threads commensurate with '
+        'FLAGS.test_shards')
     print('Saving results to %s' % FLAGS.output_directory)
 
     # Run it!
+   # _process_dataset('train', FLAGS.train_directory,
+   #                  FLAGS.train_shards, FLAGS.labels_file)
     _process_dataset('validation', FLAGS.validation_directory,
                      FLAGS.validation_shards, FLAGS.labels_file)
-    _process_dataset('train', FLAGS.train_directory,
-                     FLAGS.train_shards, FLAGS.labels_file)
+   # _process_dataset('test', FLAGS.test_directory,
+   #                  FLAGS.test_shards, FLAGS.labels_file)
 
 
 if __name__ == '__main__':
